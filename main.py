@@ -1,4 +1,3 @@
-
 from datetime import datetime
 from typing import Literal
 
@@ -10,8 +9,22 @@ from sqlalchemy.orm import Session
 from db import get_db
 from models import EventRecord
 
-EventType = Literal["click", "page_view", "purchase"]
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 
+from cache import (
+    get_cached_metrics,
+    set_cached_metrics,
+    invalidate_metrics_cache,
+)
+
+from fastapi import BackgroundTasks
+from tasks import record_recent_event
+
+import logging
+
+logging.basicConfig(level=logging.INFO)
+EventType = Literal["click", "page_view", "purchase"]
 
 class EventCreate(BaseModel):
     source: str = Field(min_length=2, max_length=100)
@@ -37,15 +50,25 @@ def health():
 @app.post("/events", response_model=EventRead, status_code=201)
 def create_event(
     payload: EventCreate,
+    background_tasks: BackgroundTasks,
     session: Session = Depends(get_db)
 ):
-    record = EventRecord(**payload.model_dump())
+    event = EventRecord(**payload.model_dump())
 
-    session.add(record)
+    session.add(event)
     session.commit()
-    session.refresh(record)
+    session.refresh(event)
 
-    return record
+    invalidate_metrics_cache(event.event_type)
+
+    background_tasks.add_task(
+        record_recent_event,
+        event.id,
+        event.event_type,
+        event.source,
+    )
+
+    return event
 
 
 @app.get("/events", response_model=list[EventRead])
@@ -88,24 +111,50 @@ def delete_event(
     if record is None:
         raise HTTPException(status_code=404, detail="Event not found")
 
+    affected_type = record.event_type
     session.delete(record)
     session.commit()
+    invalidate_metrics_cache(affected_type)
+
     return Response(status_code=204)
 
-
 @app.get("/metrics")
-def get_metrics(session: Session = Depends(get_db)):
-    rows = session.execute(
-        select(
-            EventRecord.event_type,
-            func.count(EventRecord.id)
-        ).group_by(EventRecord.event_type)
-    ).all()
+def get_metrics(
+    response: Response,
+    session: Session = Depends(get_db),
+    event_type: EventType | None = None,
+):
+    cached, cache_status = get_cached_metrics(event_type)
+    if cached is not None:
+        response.headers["X-Cache"] = cache_status
+        return cached
 
-    return {
-        "total_events": sum(count for _, count in rows),
-        "by_type": {
-            event_type: count
-            for event_type, count in rows
-        }
-    }
+    stmt = select(
+        EventRecord.event_type,
+        func.count(EventRecord.id),
+    ).group_by(EventRecord.event_type)
+
+    if event_type is not None:
+        stmt = stmt.where(EventRecord.event_type == event_type)
+
+    by_type = dict(session.execute(stmt).all())
+    metrics = {"total": sum(by_type.values()), "by_type": by_type}
+
+    if cache_status == "MISS":
+        cache_status = set_cached_metrics(metrics, event_type)
+
+    response.headers["X-Cache"] = cache_status
+    return metrics
+
+
+@app.get("/db-health")
+def db_health(session: Session = Depends(get_db)) -> dict[str, str]:
+    try:
+        session.execute(text("SELECT 1"))
+    except OperationalError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Database unavailable",
+        ) from exc
+
+    return {"database": "connected"}
