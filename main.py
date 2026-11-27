@@ -22,8 +22,14 @@ from fastapi import BackgroundTasks
 from tasks import record_recent_event
 
 import logging
+from celery_app import celery_app
+
+from kombu.exceptions import OperationalError as BrokerOperationalError
+from jobs import record_recent_event_job
 
 logging.basicConfig(level=logging.INFO)
+
+logger = logging.getLogger(__name__)
 EventType = Literal["click", "page_view", "purchase"]
 
 class EventCreate(BaseModel):
@@ -50,7 +56,7 @@ def health():
 @app.post("/events", response_model=EventRead, status_code=201)
 def create_event(
     payload: EventCreate,
-    background_tasks: BackgroundTasks,
+    response: Response,
     session: Session = Depends(get_db)
 ):
     event = EventRecord(**payload.model_dump())
@@ -59,14 +65,25 @@ def create_event(
     session.commit()
     session.refresh(event)
 
+    # Preserve Day 4 cache invalidation.
     invalidate_metrics_cache(event.event_type)
 
-    background_tasks.add_task(
-        record_recent_event,
-        event.id,
-        event.event_type,
-        event.source,
-    )
+    # Day 5: publish background work to Celery.
+    try:
+        task = record_recent_event_job.delay(
+            event.id,
+            event.event_type,
+            event.source,
+        )
+        response.headers["X-Task-ID"] = task.id
+        response.headers["X-Task-Status"] = "QUEUED"
+
+    except BrokerOperationalError:
+        logger.exception(
+            "Event %s saved, but job was not queued",
+            event.id,
+        )
+        response.headers["X-Task-Status"] = "NOT_QUEUED"
 
     return event
 
@@ -158,3 +175,12 @@ def db_health(session: Session = Depends(get_db)) -> dict[str, str]:
         ) from exc
 
     return {"database": "connected"}
+
+@app.get("/jobs/{task_id}")
+def get_job_status(task_id: str):
+    task = celery_app.AsyncResult(task_id)
+
+    return {
+        "task_id": task_id,
+        "state": task.state,
+    }
