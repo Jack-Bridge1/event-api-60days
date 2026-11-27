@@ -1,4 +1,3 @@
-
 import json
 import logging
 from datetime import datetime, timezone
@@ -8,10 +7,12 @@ from redis.exceptions import RedisError
 from cache import redis_client
 from celery_app import celery_app
 
-logger = logging.getLogger(__name__)
-
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
+
+from observability import configure_logging
+
+logger = configure_logging()
 
 RECENT_EVENTS_KEY = "events:recent"
 PROCESSED_EVENT_IDS_KEY = "events:recent:processed_ids"
@@ -32,14 +33,31 @@ redis.call("SADD", processed_key, event_id)
 return 1
 """
 
+
 @celery_app.task(
-    # Keep any explicit task name your existing decorator uses.
+    bind=True,
     autoretry_for=(RedisConnectionError, RedisTimeoutError),
     retry_backoff=True,
     max_retries=5,
     acks_late=True,
 )
-def record_recent_event_job(event_id: int, event_type: str, source: str) -> dict:
+def record_recent_event_job(
+    self,
+    event_id: int,
+    event_type: str,
+    source: str,
+    request_id: str = "-",
+) -> dict:
+
+    logger.info(
+        "worker_job_started",
+        extra={
+            "request_id": request_id,
+            "task_id": self.request.id,
+            "event_id": event_id,
+        },
+    )
+
     activity = {
         "event_id": event_id,
         "event_type": event_type,
@@ -50,7 +68,7 @@ def record_recent_event_job(event_id: int, event_type: str, source: str) -> dict
         "Processing event %s in Celery worker",
         event_id,
     )
-    
+
     inserted = redis_client.eval(
         RECORD_RECENT_EVENT_SCRIPT,
         2,

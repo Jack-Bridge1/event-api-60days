@@ -7,3 +7,4 @@ pytest
 httpx
 redis>=5.0,<8.0
 celery[redis]>=5.5,<6.0
+prometheus-client>=0.20,<1.0

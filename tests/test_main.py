@@ -10,6 +10,12 @@ from main import app
 import cache
 import models
 
+import logging
+
+import pytest
+
+import main
+from unittest.mock import Mock
 
 class FakeRedis:
     def __init__(self):
@@ -55,11 +61,9 @@ def test_health(client):
 
 
 def test_save_and_read(client):
-    response = client.post("/events", json={
-        "source": "web",
-        "event_type": "purchase",
-        "value": 99.5
-    })
+    response = client.post(
+        "/events", json={"source": "web", "event_type": "purchase", "value": 99.5}
+    )
 
     assert response.status_code == 201
 
@@ -75,11 +79,9 @@ def test_save_and_read(client):
 
 
 def test_validation(client):
-    response = client.post("/events", json={
-        "source": "web",
-        "event_type": "purchase",
-        "value": -1
-    })
+    response = client.post(
+        "/events", json={"source": "web", "event_type": "purchase", "value": -1}
+    )
 
     assert response.status_code == 422
 
@@ -99,9 +101,7 @@ def create_event(client):
     return create
 
 
-def test_filtered_and_unfiltered_metrics_use_separate_cache_keys(
-    client, create_event
-):
+def test_filtered_and_unfiltered_metrics_use_separate_cache_keys(client, create_event):
     create_event("purchase")
     create_event("click")
 
@@ -123,9 +123,7 @@ def test_filtered_and_unfiltered_metrics_use_separate_cache_keys(
         assert cached.json() == expected
 
 
-def test_new_purchase_invalidates_purchase_and_unfiltered_metrics(
-    client, create_event
-):
+def test_new_purchase_invalidates_purchase_and_unfiltered_metrics(client, create_event):
     create_event("purchase")
     create_event("click")
 
@@ -152,3 +150,41 @@ def test_new_purchase_invalidates_purchase_and_unfiltered_metrics(
     assert clicks.status_code == 200, clicks.text
     assert clicks.headers["X-Cache"] == "HIT"
     assert clicks.json() == {"total": 1, "by_type": {"click": 1}}
+
+
+@pytest.mark.parametrize(
+    ("duration_ms", "should_warn"),
+    [(499, False), (500, False), (501, True)],
+)
+def test_api_latency_warning(client, monkeypatch, caplog, duration_ms, should_warn):
+    clock = Mock(side_effect=[0, duration_ms * 1_000_000])
+    monkeypatch.setattr(main, "perf_counter_ns", clock)
+    monkeypatch.setattr(main, "SLOW_REQUEST_THRESHOLD_MS", 500)
+
+    # Capture directly from the application logger, even with propagation disabled.
+    monkeypatch.setattr(main.logger, "propagate", False)
+    main.logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.WARNING, logger=main.logger.name):
+            response = client.get("/health")
+    finally:
+        main.logger.removeHandler(caplog.handler)
+
+    assert clock.call_count == 2
+    assert response.status_code == 200
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+        and record.getMessage().startswith("slow_api_request")
+    ]
+
+    if should_warn:
+        request_id = response.headers["X-Request-ID"]
+        assert warnings == [
+            f"slow_api_request request_id={request_id} "
+            f"route=health duration_ms={duration_ms:.2f}"
+        ]
+    else:
+        assert warnings == []

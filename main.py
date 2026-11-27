@@ -27,9 +27,34 @@ from celery_app import celery_app
 from kombu.exceptions import OperationalError as BrokerOperationalError
 from jobs import record_recent_event_job
 
+from fastapi import Request
+
+from observability import (
+    configure_logging,
+    get_request_id,
+    request_id_context,
+    HTTP_REQUESTS,
+    HTTP_DURATION,
+)
+
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+from db import engine
+
+from fastapi import Request, Response
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    generate_latest,
+)
+
+import logging
+import os
+from time import perf_counter_ns
+
 logging.basicConfig(level=logging.INFO)
 
-logger = logging.getLogger(__name__)
+SLOW_REQUEST_THRESHOLD_MS = int(os.getenv("SLOW_REQUEST_THRESHOLD_MS", "500"))
 EventType = Literal["click", "page_view", "purchase"]
 
 class EventCreate(BaseModel):
@@ -47,15 +72,104 @@ class EventRead(EventCreate):
 
 app = FastAPI(title="Event Platform API")
 
+logger = configure_logging()
+
+@app.middleware("http")
+async def observe_http_requests(
+    request: Request,
+    call_next,
+):
+    request_id = get_request_id(
+        request.headers.get("X-Request-ID")
+    )
+
+    request.state.request_id = request_id
+
+    token = request_id_context.set(request_id)
+    started_ns = perf_counter_ns()
+    status_code = 500
+
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+    except Exception:
+        logger.exception("request_failed")
+        raise
+
+    finally:
+        elapsed_ns = perf_counter_ns() - started_ns
+        duration_ms = elapsed_ns / 1_000_000
+        route = request.scope.get("route")
+        route_path = getattr(route, "path", "unmatched")
+
+        if duration_ms > SLOW_REQUEST_THRESHOLD_MS:
+            logger.warning(
+                "slow_api_request request_id=%s route=%s duration_ms=%.2f",
+                request_id,
+                getattr(route, "name", "unmatched"),
+                duration_ms,
+            )
+
+        if request.url.path != "/internal/metrics":
+            HTTP_REQUESTS.labels(
+                method=request.method,
+                route=route_path,
+                status_code=str(status_code),
+            ).inc()
+
+            HTTP_DURATION.labels(
+                method=request.method,
+                route=route_path,
+            ).observe(elapsed_ns / 1_000_000_000)
+
+            logger.info(
+                "request_finished",
+                extra={
+                    "method": request.method,
+                    "route": route_path,
+                    "status_code": status_code,
+                    "duration_ms": round(duration_ms, 2),
+                },
+            )
+
+        request_id_context.reset(token)
+
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+@app.get("/ready")
+def readiness():
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+
+    except SQLAlchemyError:
+        logger.exception("postgres_not_ready")
+
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "not_ready",
+                "postgres": "down",
+            },
+        )
+
+    return {
+        "status": "ready",
+        "postgres": "up",
+    }
+
 
 @app.post("/events", response_model=EventRead, status_code=201)
 def create_event(
     payload: EventCreate,
+    request: Request,
     response: Response,
     session: Session = Depends(get_db)
 ):
@@ -74,6 +188,7 @@ def create_event(
             event.id,
             event.event_type,
             event.source,
+            request.state.request_id,
         )
         response.headers["X-Task-ID"] = task.id
         response.headers["X-Task-Status"] = "QUEUED"
@@ -184,3 +299,13 @@ def get_job_status(task_id: str):
         "task_id": task_id,
         "state": task.state,
     }
+
+@app.get(
+    "/internal/metrics",
+    include_in_schema=False,
+)
+def prometheus_metrics():
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST,
+    )
